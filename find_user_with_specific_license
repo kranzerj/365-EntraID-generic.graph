@@ -1,0 +1,17 @@
+Import-Module Microsoft.Graph
+Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All"
+
+
+Get-MgSubscribedSku
+
+
+
+$sku = Get-MgSubscribedSku -All | Where SkuPartNumber -eq 'DYN365_ENTERPRISE_PLAN1'
+
+
+$MaximumFunctionCount = 8192
+Import-Module Microsoft.Graph.Users
+
+
+Get-MgUser -Filter "assignedLicenses/any(x:x/skuId eq $($sku.SkuId) )"
+Get-MgUser -Filter "assignedLicenses/any(x:x/skuId eq $($sku.SkuId) )" | Out-File alle.crm.user
