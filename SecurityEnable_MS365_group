@@ -1,0 +1,16 @@
+use MS365 Group (Teams Members) for Intune Script  Assignments
+
+
+Connect-AzureAD
+$groupId = "xxxxxxx"
+Set-AzureADGroup -ObjectId  $groupId -SecurityEnabled $true
+
+
+
+
+MgGraph not(!!!) working
+$MaximumFunctionCount = 16543
+Import-Module Microsoft.Graph
+Connect-MgGraph -Scopes "Group.Read.All"
+$groupId = "xxxxxxx"
+Update-MgGroup -GroupId 62440fa3-e543-4170-bf2b-fedfe32752bc SecurityEnabled $true
