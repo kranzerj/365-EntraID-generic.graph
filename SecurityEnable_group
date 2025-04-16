@@ -1,7 +1,8 @@
-use MS365 Group (Teams Members) for Intune Script  Assignments
+use MS365 Group (Teams Members) or AD group for Intune Script  Assignments
 
 
 Connect-AzureAD
+Get-AzureADGroup | where {$_.DisplayName -like "*blibalbup*"}
 $groupId = "xxxxxxx"
 Set-AzureADGroup -ObjectId  $groupId -SecurityEnabled $true
 
