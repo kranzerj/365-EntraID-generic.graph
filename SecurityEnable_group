@@ -1,4 +1,4 @@
-use MS365 Group (Teams Members) or AD group for Intune Script  Assignments
+use MS365 Group (Teams Members) for Intune Script  Assignments
 
 
 Connect-AzureAD
