@@ -2,8 +2,9 @@
 
 <# 
 .SYNOPSIS
-  Findet Anmeldungen in Entra ID, die durch eine Report-Only Conditional Access Policy 
-  geblockt worden wären (z. B. Ergebnis "reportOnlyFailure").
+  Wertet Entra ID Sign-In-Logs für Conditional Access Policies aus:
+  - Report-Only: Anmeldungen, die *gebremst worden wären* (reportOnlyFailure)
+  - Aktiv: Anmeldungen, die *tatsächlich geblockt wurden* (result=failure)
 
 .BENÖTIGT
   Microsoft.Graph PowerShell (nur Teilmodule):
@@ -14,16 +15,16 @@
     AuditLog.Read.All, Policy.Read.All
 
 .HINWEIS
-  - Keine automatische Modul-Installation. Bei fehlenden Modulen werden Systemkontext-
-    Installationsbefehle angezeigt.
-  - Es werden nur benötigte Cmdlets importiert und MaximumFunctionCount wird vorsorglich erhöht.
+  - Keine automatische Modul-Installation. Bei fehlenden Modulen werden
+    Installationsbefehle für den Systemkontext ausgegeben.
+  - Nur benötigte Cmdlets werden importiert, MaximumFunctionCount wird erhöht.
 #>
 
 # --- robuste Voreinstellungen ---
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# --- Vorsorglich MaximumFunctionCount erhöhen (oder nur benötigte Module importieren) ---
+# --- Vorsorglich MaximumFunctionCount erhöhen ---
 try {
     if ($MaximumFunctionCount -lt 8192) {
         Write-Host "Erhöhe `\$MaximumFunctionCount von $MaximumFunctionCount auf 8192 ..." -ForegroundColor Yellow
@@ -54,7 +55,7 @@ if ($Missing.Count -gt 0) {
     foreach ($m in $Missing) {
         Write-Host "  Install-Module $m -Scope AllUsers -Force" -ForegroundColor Yellow
     }
-    Write-Host "`nAlternativ alle Graph-Cmdlets:" -ForegroundColor DarkYellow
+    Write-Host "`nAlternativ das Metapaket:" -ForegroundColor DarkYellow
     Write-Host "  Install-Module Microsoft.Graph -Scope AllUsers -Force" -ForegroundColor DarkYellow
     return
 }
@@ -67,10 +68,8 @@ foreach ($m in $RequiredModules) {
 }
 
 function Connect-GraphSafe {
-    # Benötigte Scopes:
     $scopes = @('AuditLog.Read.All','Policy.Read.All')
     try {
-        # Kein Willkommensbanner (falls verfügbar)
         if (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue) {
             Connect-MgGraph -Scopes $scopes -NoWelcome:$true
         } else {
@@ -81,14 +80,19 @@ function Connect-GraphSafe {
     }
 }
 
-function Get-ReportOnlyPolicies {
-    # Holt alle CA-Policies, die im Report-Only Modus sind.
-    # Graph-Wert für Report-Only ist 'enabledForReportingButNotEnforced'
-    $policies = Get-MgIdentityConditionalAccessPolicy -All |
-        Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' } |
-        Sort-Object DisplayName
-
-    return $policies
+function Prompt-Mode {
+    Write-Host ""
+    Write-Host "Auswertungsmodus wählen:" -ForegroundColor Cyan
+    Write-Host "  [1] Report-Only Policies (würden blockieren)"
+    Write-Host "  [2] Aktive Policies (tatsächlich geblockt)"
+    do {
+        $mode = Read-Host "Bitte 1 oder 2 eingeben"
+        switch ($mode) {
+            '1' { return 'ReportOnly' }
+            '2' { return 'Active' }
+            default { Write-Host "Ungültige Eingabe. Bitte 1 oder 2." -ForegroundColor Yellow }
+        }
+    } while ($true)
 }
 
 function Prompt-DaysBack {
@@ -99,13 +103,21 @@ function Prompt-DaysBack {
     } while ($true)
 }
 
+function Get-PoliciesByState([string]$stateValue) {
+    # state: 'enabled' (aktiv), 'enabledForReportingButNotEnforced' (report-only), 'disabled'
+    $policies = Get-MgIdentityConditionalAccessPolicy -All |
+        Where-Object { $_.State -eq $stateValue } |
+        Sort-Object DisplayName
+    return $policies
+}
+
 function Prompt-SelectPolicies($policies) {
     if (-not $policies -or $policies.Count -eq 0) {
-        Write-Host "Es wurden keine Report-Only Conditional Access Policies gefunden." -ForegroundColor Yellow
+        Write-Host "Keine Policies in diesem Zustand gefunden." -ForegroundColor Yellow
         return @()
     }
 
-    Write-Host "`nReport-Only Policies:" -ForegroundColor Cyan
+    Write-Host "`nGefundene Policies:" -ForegroundColor Cyan
     for ($i=0; $i -lt $policies.Count; $i++) {
         Write-Host ("  [{0}] {1}" -f $i, $policies[$i].DisplayName)
     }
@@ -125,11 +137,9 @@ function Prompt-SelectPolicies($policies) {
 
 function Would-Be-Blocked($appliedPolicy) {
     <#
-      Prüft, ob eine angewandte CA-Policy (im Report-Only Kontex) diese Anmeldung geblockt hätte.
-      Wir werten robust aus:
-        - result enthält 'reportOnlyFailure' (oder allgemein 'reportOnly' + 'failure')
+      Report-Only: zählt als "würde blockieren", wenn:
+        - appliedPolicy.result enthält 'reportOnlyFailure' (oder 'reportOnly' + 'failure')
         - Fallback: reportOnly=$true und result='failure'
-      Damit decken wir sowohl 'Grant: Block' als auch 'Grant: grant' (mit nicht erfüllten Controls) ab.
     #>
     if ($null -eq $appliedPolicy) { return $false }
 
@@ -142,10 +152,24 @@ function Would-Be-Blocked($appliedPolicy) {
     return $false
 }
 
-function Get-ReportOnlyBlockedSignIns([DateTime]$sinceUtc, [string[]]$policyNames) {
-    Write-Host "`nLese Sign-In-Logs seit $($sinceUtc.ToString('u')) UTC ..." -ForegroundColor Cyan
+function Was-Blocked-ByPolicy($signIn, $appliedPolicy, [string[]]$policyNames) {
+    <#
+      Aktiv: zählt als "tatsächlich geblockt", wenn:
+        - signIn.conditionalAccessStatus = 'failure'  UND
+        - appliedPolicy.displayName in Auswahl  UND
+        - appliedPolicy.result = 'failure'
+      (unabhängig davon, ob Grant=Block oder Grant=Grant mit nicht erfüllten Controls)
+    #>
+    if ($null -eq $signIn -or $null -eq $appliedPolicy) { return $false }
+    if ($signIn.conditionalAccessStatus -ne 'failure') { return $false }
+    if ($appliedPolicy.displayName -notin $policyNames) { return $false }
+    if ([string]$appliedPolicy.result -match '^(?i)failure$') { return $true }
+    return $false
+}
 
-    # Felder einschränken, damit die Antwort kompakt bleibt
+function Get-ReportOnlyBlockedSignIns([DateTime]$sinceUtc, [string[]]$policyNames) {
+    Write-Host "`nLese Sign-In-Logs (Report-Only) seit $($sinceUtc.ToString('u')) UTC ..." -ForegroundColor Cyan
+
     $props = @(
         'id','createdDateTime','userPrincipalName','ipAddress','appDisplayName',
         'clientAppUsed','conditionalAccessStatus','appliedConditionalAccessPolicies'
@@ -153,21 +177,20 @@ function Get-ReportOnlyBlockedSignIns([DateTime]$sinceUtc, [string[]]$policyName
     $filter = "createdDateTime ge {0}" -f $sinceUtc.ToString("o")
 
     $signIns = Get-MgAuditLogSignIn -Filter $filter -All -Property $props
-
     if (-not $signIns) { return @() }
 
-    # Filtern auf Einträge, wo mindestens eine der gewählten Policies 'would block' ergeben hätte
     $hits = foreach ($s in $signIns) {
         $caps = @($s.appliedConditionalAccessPolicies)
         if (-not $caps -or $caps.Count -eq 0) { continue }
 
-        # nur die interessierenden Policies (per DisplayName) betrachten
+        # nur die interessierenden Policies (per DisplayName)
         $caps = $caps | Where-Object { $_.displayName -in $policyNames }
         if ($caps.Count -eq 0) { continue }
 
         foreach ($cap in $caps) {
             if (Would-Be-Blocked $cap) {
                 [PSCustomObject]@{
+                    Mode                      = 'Report-Only (würde blockieren)'
                     When                      = [datetime]$s.createdDateTime
                     User                      = $s.userPrincipalName
                     App                       = $s.appDisplayName
@@ -182,7 +205,45 @@ function Get-ReportOnlyBlockedSignIns([DateTime]$sinceUtc, [string[]]$policyName
         }
     }
 
-    # Chronologisch sortieren
+    $hits | Sort-Object When
+}
+
+function Get-ActiveBlockedSignIns([DateTime]$sinceUtc, [string[]]$policyNames) {
+    Write-Host "`nLese Sign-In-Logs (Aktive Policies) seit $($sinceUtc.ToString('u')) UTC ..." -ForegroundColor Cyan
+
+    $props = @(
+        'id','createdDateTime','userPrincipalName','ipAddress','appDisplayName',
+        'clientAppUsed','conditionalAccessStatus','appliedConditionalAccessPolicies'
+    )
+    $filter = "createdDateTime ge {0}" -f $sinceUtc.ToString("o")
+
+    $signIns = Get-MgAuditLogSignIn -Filter $filter -All -Property $props
+    if (-not $signIns) { return @() }
+
+    $hits = foreach ($s in $signIns) {
+        if ($s.conditionalAccessStatus -ne 'failure') { continue }
+
+        $caps = @($s.appliedConditionalAccessPolicies)
+        if (-not $caps -or $caps.Count -eq 0) { continue }
+
+        foreach ($cap in $caps) {
+            if (Was-Blocked-ByPolicy -signIn $s -appliedPolicy $cap -policyNames $policyNames) {
+                [PSCustomObject]@{
+                    Mode                      = 'Aktiv (tatsächlich geblockt)'
+                    When                      = [datetime]$s.createdDateTime
+                    User                      = $s.userPrincipalName
+                    App                       = $s.appDisplayName
+                    IP                        = $s.ipAddress
+                    ClientApp                 = $s.clientAppUsed
+                    Policy                    = $cap.displayName
+                    GrantControls             = ($cap.enforcedGrantControls -join ',')
+                    Result                    = $cap.result
+                    ConditionsNotSatisfied    = if ($cap.PSObject.Properties.Name -contains 'conditionsNotSatisfied') { ($cap.conditionsNotSatisfied -join ',') } else { $null }
+                }
+            }
+        }
+    }
+
     $hits | Sort-Object When
 }
 
@@ -190,53 +251,70 @@ try {
     # 1) Verbinden
     Connect-GraphSafe
 
-    # 2) Zeitfenster abfragen
+    # 2) Modus + Zeitfenster
+    $mode = Prompt-Mode
     $daysBack = Prompt-DaysBack
     $sinceUtc = (Get-Date).ToUniversalTime().AddDays(-[double]$daysBack)
 
-    # 3) Report-Only Policies laden und Auswahl treffen
-    $reportOnlyPolicies = Get-ReportOnlyPolicies
-    $selectedPolicies = Prompt-SelectPolicies -policies $reportOnlyPolicies
-    if ($selectedPolicies.Count -eq 0) { return }
+    # 3) Policies laden nach Modus
+    switch ($mode) {
+        'ReportOnly' {
+            $policies = Get-PoliciesByState -stateValue 'enabledForReportingButNotEnforced'
+        }
+        'Active' {
+            $policies = Get-PoliciesByState -stateValue 'enabled'
+        }
+    }
 
-    $selectedNames = $selectedPolicies.DisplayName
+    $selected = Prompt-SelectPolicies -policies $policies
+    if ($selected.Count -eq 0) { return }
+    $selectedNames = $selected.DisplayName
 
     # 4) Logs auswerten
-    $results = Get-ReportOnlyBlockedSignIns -sinceUtc $sinceUtc -policyNames $selectedNames
+    switch ($mode) {
+        'ReportOnly' {
+            $results = Get-ReportOnlyBlockedSignIns -sinceUtc $sinceUtc -policyNames $selectedNames
+        }
+        'Active' {
+            $results = Get-ActiveBlockedSignIns -sinceUtc $sinceUtc -policyNames $selectedNames
+        }
+    }
 
     Write-Host ""
     Write-Host "=================== AUSWERTUNG ===================" -ForegroundColor Green
+    Write-Host ("Modus: {0}" -f ($mode -eq 'ReportOnly' ? 'Report-Only (würde blockieren)' : 'Aktiv (tatsächlich geblockt)'))
     Write-Host ("Zeitraum: Letzte {0} Tag(e) (ab {1} UTC)" -f $daysBack, $sinceUtc.ToString('u'))
+    Write-Host ("Policies: {0}" -f ($selectedNames -join ', '))
 
     if (-not $results -or $results.Count -eq 0) {
-        Write-Host "Keine Anmeldeversuche gefunden, die durch die ausgewählte(n) Report-Only-Policy geblockt worden wären." -ForegroundColor Yellow
+        Write-Host "Keine Anmeldeversuche entsprechend der Kriterien gefunden." -ForegroundColor Yellow
         return
     }
 
     $total = $results.Count
-    Write-Host ("Gefundene hypothetisch *geblockte* Anmeldungen: {0}" -f $total) -ForegroundColor Cyan
+    Write-Host ("Gefundene Anmeldungen: {0}" -f $total) -ForegroundColor Cyan
 
     # Kleine Statistik
     $byUser = $results | Group-Object User | Sort-Object Count -Descending
     $byIP   = $results | Group-Object IP   | Sort-Object Count -Descending
 
-    Write-Host "`nTop 10 Benutzer (würden geblockt):" -ForegroundColor Cyan
+    Write-Host "`nTop 10 Benutzer:" -ForegroundColor Cyan
     $byUser | Select-Object -First 10 | ForEach-Object {
         "{0,4}  {1}" -f $_.Count, $_.Name
     } | Write-Host
 
-    Write-Host "`nTop 10 IPs (würden geblockt):" -ForegroundColor Cyan
+    Write-Host "`nTop 10 IPs:" -ForegroundColor Cyan
     $byIP | Select-Object -First 10 | ForEach-Object {
         "{0,4}  {1}" -f $_.Count, $_.Name
     } | Write-Host
 
     Write-Host "`nDetails (letzte 50):" -ForegroundColor Cyan
-    $results | Select-Object -Last 50 | Format-Table When, User, IP, App, Policy, GrantControls, Result -AutoSize
+    $results | Select-Object -Last 50 | Format-Table Mode, When, User, IP, App, Policy, GrantControls, Result -AutoSize
 
     # Optionaler CSV-Export
     $export = Read-Host "`nCSV exportieren? (y/N)"
     if ($export -match '^(?i)y(es)?$') {
-        $path = Join-Path -Path (Get-Location) -ChildPath ("ReportOnly-Blocks_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
+        $path = Join-Path -Path (Get-Location) -ChildPath ("CA-Blocks_{0}_{1:yyyyMMdd_HHmmss}.csv" -f $mode, (Get-Date))
         $results | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
         Write-Host "CSV exportiert: $path" -ForegroundColor Green
     }
