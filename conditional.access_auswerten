@@ -1,4 +1,6 @@
 #ca.log.ausgeben.ps1
+#use Powershell 7
+#unblock-File .\ca.log.ausgeben.ps1
 
 <# 
 .SYNOPSIS
